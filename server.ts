@@ -20,12 +20,25 @@ const PORT = !isProd ? 3000 : parseInt(process.env.PORT || '3000', 10);
 
 app.use(express.json());
 
-// Persistent local storage path as safe fallback/cache
-const DATA_DIR = path.join(__dirname, 'data');
+// Local JSON fallback. Vercel instances use writable ephemeral storage; persistent records sync through Supabase.
+const BUNDLED_DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.VERCEL ? path.join('/tmp', 'data') : BUNDLED_DATA_DIR;
 const ENQUIRIES_FILE = path.join(DATA_DIR, 'enquiries.json');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+if (process.env.VERCEL && fs.existsSync(BUNDLED_DATA_DIR)) {
+  for (const fileName of fs.readdirSync(BUNDLED_DATA_DIR)) {
+    if (!fileName.endsWith('.json')) continue;
+
+    const bundledFile = path.join(BUNDLED_DATA_DIR, fileName);
+    const runtimeFile = path.join(DATA_DIR, fileName);
+    if (!fs.existsSync(runtimeFile)) {
+      fs.copyFileSync(bundledFile, runtimeFile);
+    }
+  }
 }
 
 // Seed initial enquiries if none exist
@@ -3375,7 +3388,7 @@ async function startServer() {
 
 export default app;
 
-if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+if (!process.env.VERCEL && process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   startServer().catch(err => {
     console.error('[Fatal Server Startup Error]:', err);
   });
