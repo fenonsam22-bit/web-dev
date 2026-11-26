@@ -2,7 +2,6 @@ import express from 'express';
 import type { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
-import { createServer as createHttpServer } from 'http';
 import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
@@ -16,16 +15,31 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const isProd = process.env.NODE_ENV === 'production';
+const isVercel = Boolean(process.env.VERCEL);
 const PORT = !isProd ? 3000 : parseInt(process.env.PORT || '3000', 10);
 
 app.use(express.json());
 
-// Persistent local storage path as safe fallback/cache
-const DATA_DIR = path.join(__dirname, 'data');
+// Persistent local storage path as safe fallback/cache (uses writable /tmp on Vercel)
+const BUNDLED_DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = isVercel ? path.join('/tmp', 'teamstars-data') : BUNDLED_DATA_DIR;
 const ENQUIRIES_FILE = path.join(DATA_DIR, 'enquiries.json');
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+try {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (isVercel && fs.existsSync(BUNDLED_DATA_DIR)) {
+    for (const file of fs.readdirSync(BUNDLED_DATA_DIR)) {
+      const dest = path.join(DATA_DIR, file);
+      const src = path.join(BUNDLED_DATA_DIR, file);
+      if (!fs.existsSync(dest) && fs.statSync(src).isFile()) {
+        fs.copyFileSync(src, dest);
+      }
+    }
+  }
+} catch (fsErr) {
+  console.warn('[Storage] Local data dir setup warning:', fsErr);
 }
 
 // Seed initial enquiries if none exist
@@ -439,15 +453,15 @@ function validateStrongPassword(password: string): string | null {
   return null;
 }
 
-// User In-Memory Sessions
+// User Sessions (Stateless HMAC-SHA256 signed tokens for serverless compatibility + in-memory tracking)
 const userSessions = new Map<string, { userId: string; expiresAt: number }>();
 
 function generateUserToken(userId: string): string {
-  const token = `ts_usr_${userId}_${crypto.randomBytes(16).toString('hex')}`;
-  userSessions.set(token, {
-    userId,
-    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 // 7 days
-  });
+  const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
+  const payload = Buffer.from(JSON.stringify({ uid: userId, iat: Date.now(), exp: expiresAt })).toString('base64url');
+  const sig = crypto.createHmac('sha256', ADMIN_TOKEN_SECRET).update(payload).digest('base64url');
+  const token = `ts_usr_${payload}.${sig}`;
+  userSessions.set(token, { userId, expiresAt });
   return token;
 }
 
@@ -462,18 +476,53 @@ function revokeUserSessions(userId: string): number {
   return removed;
 }
 
-function getAuthenticatedUser(req: Request): any | null {
+async function getAuthenticatedUser(req: Request): Promise<any | null> {
   const authHeader = req.headers.authorization;
   if (!authHeader) return null;
   const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  const session = userSessions.get(token);
-  if (!session) return null;
-  if (session.expiresAt < Date.now()) {
-    userSessions.delete(token);
+  let sessionUserId: string | null = null;
+  let tokenIssuedAt = 0;
+
+  if (token.startsWith('ts_usr_') && token.includes('.')) {
+    const raw = token.slice('ts_usr_'.length);
+    const dotIdx = raw.lastIndexOf('.');
+    if (dotIdx > 0) {
+      const payload = raw.slice(0, dotIdx);
+      const sig = raw.slice(dotIdx + 1);
+      const expectedSig = crypto.createHmac('sha256', ADMIN_TOKEN_SECRET).update(payload).digest('base64url');
+      const sigBuf = Buffer.from(sig);
+      const expectedBuf = Buffer.from(expectedSig);
+      if (sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+        try {
+          const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf-8'));
+          if (parsed?.uid && typeof parsed.exp === 'number' && parsed.exp > Date.now()) {
+            sessionUserId = String(parsed.uid);
+            tokenIssuedAt = Number(parsed.iat || 0);
+          }
+        } catch {
+          sessionUserId = null;
+        }
+      }
+    }
+  }
+
+  if (!sessionUserId) {
+    const session = userSessions.get(token);
+    if (!session) return null;
+    if (session.expiresAt < Date.now()) {
+      userSessions.delete(token);
+      return null;
+    }
+    sessionUserId = session.userId;
+  }
+
+  const users = await fetchUsers();
+  const user = users.find((u: any) => u.user_id === sessionUserId && u.status === 'active' && !u.is_deleted) || null;
+  if (!user) return null;
+  if (user.password_changed_at && tokenIssuedAt > 0 && tokenIssuedAt < new Date(user.password_changed_at).getTime()) {
     return null;
   }
-  const users = getLocalUsers();
-  return users.find((u: any) => u.user_id === session.userId && u.status === 'active' && !u.is_deleted) || null;
+  return user;
 }
 
 // 0. Schemes & Version History Storage & Seeding
@@ -561,8 +610,8 @@ function saveLocalSchemeVersions(versions: any[]): void {
   fs.writeFileSync(SCHEME_VERSIONS_FILE, JSON.stringify(versions, null, 2));
 }
 
-function recordSchemeVersion(scheme: any, changeReason: string, createdBy: string = 'Admin') {
-  const versions = getLocalSchemeVersions();
+async function recordSchemeVersion(scheme: any, changeReason: string, createdBy: string = 'Admin') {
+  const versions = await fetchSchemeVersions();
   const entry = {
     id: `schv-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
     scheme_id: scheme.id,
@@ -578,7 +627,7 @@ function recordSchemeVersion(scheme: any, changeReason: string, createdBy: strin
   };
   versions.unshift(entry);
   saveLocalSchemeVersions(versions);
-  void syncTableUpsert('scheme_versions', [schemeVersionToDbRow(entry)], 'id');
+  await syncTableUpsert('scheme_versions', [schemeVersionToDbRow(entry)], 'id');
 }
 
 if (!fs.existsSync(SCHEMES_FILE)) {
@@ -699,7 +748,20 @@ if (!fs.existsSync(SCHEMES_FILE)) {
   ];
   saveLocalSchemes(seededSchemes);
   if (!fs.existsSync(SCHEME_VERSIONS_FILE)) {
-    seededSchemes.forEach((s) => recordSchemeVersion(s, 'Initial seeded scheme', 'System'));
+    const initialVersions = seededSchemes.map((s) => ({
+      id: `schv-${s.id}-v1`,
+      scheme_id: s.id,
+      version: s.version || 1,
+      name_en: s.nameEn,
+      chit_value: s.chitValue,
+      duration_months: s.durationMonths,
+      available_durations: s.availableDurations || [s.durationMonths],
+      snapshot_data: s,
+      change_reason: 'Initial seeded scheme',
+      created_by: 'System',
+      created_at: now
+    }));
+    saveLocalSchemeVersions(initialVersions);
   }
 } else {
   // Non-destructive upgrade: ensure ₹10,00,000 scheme exists if not already present
@@ -742,7 +804,6 @@ if (!fs.existsSync(SCHEMES_FILE)) {
     };
     existingSchemes.push(tenLakh);
     saveLocalSchemes(existingSchemes);
-    recordSchemeVersion(tenLakh, 'Added default ₹10,00,000 scheme', 'System');
   }
 }
 
@@ -1060,8 +1121,8 @@ function saveLocalAuditLogs(logs: any[]): void {
   fs.writeFileSync(AUDIT_LOGS_FILE, JSON.stringify(logs, null, 2));
 }
 
-function recordAuditLog(action: string, details: string, performed_by: string = 'Admin', target_id?: string): void {
-  const all = getLocalAuditLogs();
+async function recordAuditLog(action: string, details: string, performed_by: string = 'Admin', target_id?: string): Promise<void> {
+  const all = await fetchAuditLogs();
   const entry = {
     id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
     action,
@@ -1071,19 +1132,23 @@ function recordAuditLog(action: string, details: string, performed_by: string = 
     timestamp: new Date().toISOString()
   };
   all.unshift(entry);
-  // Keep latest 500 logs
   if (all.length > 500) all.length = 500;
   saveLocalAuditLogs(all);
-  void syncTableUpsert('audit_logs', [auditLogToDbRow(entry)], 'id');
+  await syncTableUpsert('audit_logs', [auditLogToDbRow(entry)], 'id');
 }
 
 if (!fs.existsSync(AUDIT_LOGS_FILE)) {
-  recordAuditLog("SYSTEM_BOOT", "Chit Fund Management System Initialized with 3 Active Batches", "System");
+  saveLocalAuditLogs([{
+    id: 'log-system-boot',
+    action: 'SYSTEM_BOOT',
+    details: 'Chit Fund Management System Initialized with 3 Active Batches',
+    performed_by: 'System',
+    timestamp: new Date().toISOString()
+  }]);
 }
 
-
 // Helper: Automatic Announcement Engine (triggered ONLY after confirmed DB/file save, with deduplication)
-function createAutoAnnouncement(params: {
+async function createAutoAnnouncement(params: {
   title: string;
   description: string;
   category: 'Scheme Update' | 'Group Update' | 'Payment Notice' | 'Important' | 'General';
@@ -1094,7 +1159,7 @@ function createAutoAnnouncement(params: {
   target_scheme_name?: string;
   source_event_key: string;
 }) {
-  const announcements = getLocalAnnouncements();
+  const announcements = await fetchAnnouncements();
   const cutoff = Date.now() - 5 * 60 * 1000;
   const duplicate = announcements.find(
     (a: any) =>
@@ -1125,8 +1190,150 @@ function createAutoAnnouncement(params: {
 
   announcements.unshift(newAnn);
   saveLocalAnnouncements(announcements);
-  void syncTableUpsert('announcements', [announcementToDbRow(newAnn)], 'id');
+  await syncTableUpsert('announcements', [announcementToDbRow(newAnn)], 'id');
   return newAnn;
+}
+
+// Live Supabase-First Read Helpers (always read live DB when Supabase is configured, with local JSON fallback)
+const seededEmptyTables = new Set<string>();
+
+async function fetchLiveTable<T = any>(
+  table: string,
+  options: {
+    orderBy?: { column: string; ascending?: boolean };
+    limit?: number;
+    mapRow?: (row: any) => T;
+    toDbRow?: (item: any) => any;
+    getLocal: () => T[];
+    saveLocal: (items: T[]) => void;
+  }
+): Promise<T[]> {
+  if (!supabase) {
+    return options.getLocal();
+  }
+  try {
+    let query = (supabase as any).from(table).select('*');
+    if (options.orderBy) {
+      query = query.order(options.orderBy.column, { ascending: options.orderBy.ascending ?? false });
+    }
+    if (options.limit) {
+      query = query.limit(options.limit);
+    }
+    const { data, error } = await query;
+    if (error) {
+      console.warn(`[Supabase] Live read warning (${table}):`, error.message);
+      return options.getLocal();
+    }
+    supabaseTablesReady = true;
+    if (Array.isArray(data) && data.length > 0) {
+      const mapped = options.mapRow ? data.map(options.mapRow) : (data as T[]);
+      options.saveLocal(mapped);
+      return mapped;
+    }
+    if (Array.isArray(data) && data.length === 0 && !seededEmptyTables.has(table)) {
+      seededEmptyTables.add(table);
+      const localItems = options.getLocal();
+      if (localItems.length > 0) {
+        const dbRows = options.toDbRow ? localItems.map(options.toDbRow) : localItems;
+        await syncTableUpsert(table, dbRows, 'id');
+        return localItems;
+      }
+    }
+    return [];
+  } catch (err) {
+    console.warn(`[Supabase] Live read exception (${table}):`, err);
+    return options.getLocal();
+  }
+}
+
+async function fetchSchemes(): Promise<any[]> {
+  return fetchLiveTable('chit_schemes', {
+    mapRow: dbRowToScheme,
+    toDbRow: schemeToDbRow,
+    getLocal: getLocalSchemes,
+    saveLocal: saveLocalSchemes
+  });
+}
+
+async function fetchSchemeVersions(): Promise<any[]> {
+  return fetchLiveTable('scheme_versions', {
+    orderBy: { column: 'created_at', ascending: false },
+    toDbRow: schemeVersionToDbRow,
+    getLocal: getLocalSchemeVersions,
+    saveLocal: saveLocalSchemeVersions
+  });
+}
+
+async function fetchGroups(): Promise<any[]> {
+  return fetchLiveTable('chit_groups', {
+    mapRow: dbRowToGroup,
+    toDbRow: groupToDbRow,
+    getLocal: getLocalGroups,
+    saveLocal: saveLocalGroups
+  });
+}
+
+async function fetchUsers(): Promise<any[]> {
+  return fetchLiveTable('chit_users', {
+    toDbRow: userToDbRow,
+    getLocal: getLocalUsers,
+    saveLocal: saveLocalUsers
+  });
+}
+
+async function fetchPaymentConfigs(): Promise<any[]> {
+  return fetchLiveTable('monthly_payment_configs', {
+    orderBy: { column: 'created_at', ascending: false },
+    mapRow: (c: any) => ({
+      ...c,
+      month: Number(c.month),
+      year: Number(c.year),
+      payment_amount: Number(c.payment_amount)
+    }),
+    toDbRow: paymentConfigToDbRow,
+    getLocal: getLocalPaymentConfigs,
+    saveLocal: saveLocalPaymentConfigs
+  });
+}
+
+async function fetchPayments(): Promise<any[]> {
+  return fetchLiveTable('payment_records', {
+    mapRow: dbRowToPayment,
+    toDbRow: paymentToDbRow,
+    getLocal: getLocalPayments,
+    saveLocal: saveLocalPayments
+  });
+}
+
+async function fetchAnnouncements(): Promise<any[]> {
+  return fetchLiveTable('announcements', {
+    orderBy: { column: 'created_at', ascending: false },
+    toDbRow: announcementToDbRow,
+    getLocal: getLocalAnnouncements,
+    saveLocal: saveLocalAnnouncements
+  });
+}
+
+async function fetchEnquiries(): Promise<any[]> {
+  return fetchLiveTable('enquiries', {
+    orderBy: { column: 'created_at', ascending: false },
+    getLocal: getLocalEnquiries,
+    saveLocal: (items) => {
+      try {
+        fs.writeFileSync(ENQUIRIES_FILE, JSON.stringify(items, null, 2));
+      } catch {}
+    }
+  });
+}
+
+async function fetchAuditLogs(): Promise<any[]> {
+  return fetchLiveTable('audit_logs', {
+    orderBy: { column: 'timestamp', ascending: false },
+    limit: 500,
+    toDbRow: auditLogToDbRow,
+    getLocal: getLocalAuditLogs,
+    saveLocal: saveLocalAuditLogs
+  });
 }
 
 // Supabase Startup Hydration & Idempotent First-Run Seeding
@@ -1300,8 +1507,8 @@ function isValidAdminAuth(req: Request): boolean {
 // ======================== API ROUTES ========================
 
 // Public: Active Chit Schemes
-app.get('/api/schemes', (_req: Request, res: Response) => {
-  const schemes = getLocalSchemes()
+app.get('/api/schemes', async (_req: Request, res: Response) => {
+  const schemes = (await fetchSchemes())
     .filter((s: any) => (s.status || 'active') === 'active')
     .sort((a: any, b: any) => Number(a.chitValue) - Number(b.chitValue));
   res.json({ schemes });
@@ -1309,7 +1516,7 @@ app.get('/api/schemes', (_req: Request, res: Response) => {
 
 // Health & System status endpoint
 app.get('/api/system/status', async (_req: Request, res: Response) => {
-  const localEnquiries = getLocalEnquiries();
+  const localEnquiries = await fetchEnquiries();
   let supabaseConnected = false;
   let tablesReady = supabaseTablesReady;
   if (supabase) {
@@ -1321,7 +1528,7 @@ app.get('/api/system/status', async (_req: Request, res: Response) => {
         tablesReady = true;
         if (!supabaseTablesReady) {
           supabaseTablesReady = true;
-          void bootstrapSupabaseData();
+          await bootstrapSupabaseData();
         }
       } else {
         supabaseConnected = !pingErr;
@@ -1668,7 +1875,7 @@ app.patch('/api/admin/enquiries/:id/status', async (req: Request, res: Response)
 // ======================== USER / MEMBER PORTAL ROUTES ========================
 
 // Member Login
-app.post('/api/user/login', (req: Request, res: Response) => {
+app.post('/api/user/login', async (req: Request, res: Response) => {
   try {
     const { user_id, password } = req.body;
     if (!user_id || !password) {
@@ -1676,7 +1883,7 @@ app.post('/api/user/login', (req: Request, res: Response) => {
     }
 
     const cleanUserId = user_id.trim();
-    const users = getLocalUsers();
+    const [users, groups] = await Promise.all([fetchUsers(), fetchGroups()]);
     const user = users.find((u: any) => u.user_id.toLowerCase() === cleanUserId.toLowerCase());
 
     if (!user) {
@@ -1692,9 +1899,8 @@ app.post('/api/user/login', (req: Request, res: Response) => {
     }
 
     const token = generateUserToken(user.user_id);
-    recordAuditLog('USER_LOGIN', `Member logged in: ${user.user_id} (${user.full_name})`, user.user_id, user.id);
+    await recordAuditLog('USER_LOGIN', `Member logged in: ${user.user_id} (${user.full_name})`, user.user_id, user.id);
 
-    const groups = getLocalGroups();
     const group = groups.find((g: any) => g.id === user.group_id);
 
     // Return sanitized user profile (without password_hash)
@@ -1718,13 +1924,13 @@ app.post('/api/user/login', (req: Request, res: Response) => {
 });
 
 // Member Profile
-app.get('/api/user/profile', (req: Request, res: Response) => {
-  const authUser = getAuthenticatedUser(req);
+app.get('/api/user/profile', async (req: Request, res: Response) => {
+  const authUser = await getAuthenticatedUser(req);
   if (!authUser) {
     return res.status(401).json({ error: 'Unauthorized. Please log in as a member.' });
   }
 
-  const groups = getLocalGroups();
+  const groups = await fetchGroups();
   const group = groups.find((g: any) => g.id === authUser.group_id);
 
   const { password_hash, ...safeUser } = authUser;
@@ -1740,13 +1946,13 @@ app.get('/api/user/profile', (req: Request, res: Response) => {
 });
 
 // Member Payments (Strictly filtered to the logged-in user only!)
-app.get('/api/user/payments', (req: Request, res: Response) => {
-  const authUser = getAuthenticatedUser(req);
+app.get('/api/user/payments', async (req: Request, res: Response) => {
+  const authUser = await getAuthenticatedUser(req);
   if (!authUser) {
     return res.status(401).json({ error: 'Unauthorized. Please log in as a member.' });
   }
 
-  const allPayments = getLocalPayments();
+  const allPayments = await fetchPayments();
   const userPayments = allPayments.filter((p: any) => p.user_id === authUser.user_id);
 
   // Sort: highest year, then highest month desc
@@ -1776,15 +1982,14 @@ app.get('/api/user/payments', (req: Request, res: Response) => {
 });
 
 // Member Announcements (Read-only, filtered strictly by non-archived, published, and audience targeting)
-app.get('/api/user/announcements', (req: Request, res: Response) => {
-  const authUser = getAuthenticatedUser(req);
+app.get('/api/user/announcements', async (req: Request, res: Response) => {
+  const authUser = await getAuthenticatedUser(req);
   if (!authUser) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
 
-  const groups = getLocalGroups();
+  const [groups, announcements] = await Promise.all([fetchGroups(), fetchAnnouncements()]);
   const userGroup = groups.find((g: any) => g.id === authUser.group_id);
-  const announcements = getLocalAnnouncements();
 
   const published = announcements.filter((a: any) => {
     if (!a.is_published || a.is_archived) return false;
@@ -1814,16 +2019,19 @@ app.post('/api/user/logout', (req: Request, res: Response) => {
 
 // ======================== ADMIN DASHBOARD OVERVIEW & REPORTS ========================
 
-app.get('/api/admin/overview', (req: Request, res: Response) => {
+app.get('/api/admin/overview', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
 
-  const users = getLocalUsers().filter((u: any) => !u.is_deleted);
-  const groups = getLocalGroups();
-  const schemes = getLocalSchemes();
-  const payments = getLocalPayments();
-  const auditLogs = getLocalAuditLogs();
+  const [allUsers, groups, schemes, payments, auditLogs] = await Promise.all([
+    fetchUsers(),
+    fetchGroups(),
+    fetchSchemes(),
+    fetchPayments(),
+    fetchAuditLogs()
+  ]);
+  const users = allUsers.filter((u: any) => !u.is_deleted);
 
   const totalUsers = users.length;
   const totalGroups = groups.filter((g: any) => g.status !== 'archived').length;
@@ -1872,14 +2080,12 @@ app.get('/api/admin/overview', (req: Request, res: Response) => {
   });
 });
 
-app.get('/api/admin/reports', (req: Request, res: Response) => {
+app.get('/api/admin/reports', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
 
-  const users = getLocalUsers();
-  const groups = getLocalGroups();
-  const payments = getLocalPayments();
+  const [users, groups, payments] = await Promise.all([fetchUsers(), fetchGroups(), fetchPayments()]);
 
   // Monthly breakdown
   const monthlyStats: Record<string, { monthName: string; totalPaid: number; totalUnpaid: number; countPaid: number; countUnpaid: number }> = {};
@@ -1929,22 +2135,24 @@ app.get('/api/admin/reports', (req: Request, res: Response) => {
   });
 });
 
-app.get('/api/admin/audit-logs', (req: Request, res: Response) => {
+app.get('/api/admin/audit-logs', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
-  return res.json({ logs: getLocalAuditLogs() });
+  return res.json({ logs: await fetchAuditLogs() });
 });
 
 // ======================== ADMIN SCHEME MANAGEMENT & VERSIONING ========================
 
-app.get('/api/admin/schemes', (req: Request, res: Response) => {
+app.get('/api/admin/schemes', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
-  const schemes = getLocalSchemes();
-  const groups = getLocalGroups();
-  const versions = getLocalSchemeVersions();
+  const [schemes, groups, versions] = await Promise.all([
+    fetchSchemes(),
+    fetchGroups(),
+    fetchSchemeVersions()
+  ]);
 
   const enriched = schemes.map((s: any) => {
     const refGroups = groups.filter((g: any) => g.scheme_id === s.id || Number(g.chit_value) === Number(s.chitValue));
@@ -1959,12 +2167,12 @@ app.get('/api/admin/schemes', (req: Request, res: Response) => {
   return res.json({ schemes: enriched, versions });
 });
 
-app.get('/api/admin/schemes/:id/versions', (req: Request, res: Response) => {
+app.get('/api/admin/schemes/:id/versions', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
   const { id } = req.params;
-  const versions = getLocalSchemeVersions().filter((v: any) => v.scheme_id === id);
+  const versions = (await fetchSchemeVersions()).filter((v: any) => v.scheme_id === id);
   return res.json({ versions });
 });
 
@@ -1997,7 +2205,7 @@ app.post('/api/admin/schemes', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Duration must be between 2 and 60 months.' });
   }
 
-  const schemes = getLocalSchemes();
+  const schemes = await fetchSchemes();
   const normalizedName = nameEn.trim().toLowerCase();
   const cleanCode = (schemeCode || `TSC-${Math.round(numValue / 1000)}K-${numDuration}M`).trim().toUpperCase();
 
@@ -2058,11 +2266,11 @@ app.post('/api/admin/schemes', async (req: Request, res: Response) => {
   schemes.push(newScheme);
   saveLocalSchemes(schemes);
   await syncTableUpsert('chit_schemes', [schemeToDbRow(newScheme)], 'id');
-  recordSchemeVersion(newScheme, 'Created new chit scheme', 'Admin');
-  recordAuditLog('SCHEME_CREATE', `Created Scheme: ${newScheme.nameEn} (${newScheme.durationMonths} Months, ${newScheme.chitValueFormatted})`, 'Admin', newScheme.id);
+  await recordSchemeVersion(newScheme, 'Created new chit scheme', 'Admin');
+  await recordAuditLog('SCHEME_CREATE', `Created Scheme: ${newScheme.nameEn} (${newScheme.durationMonths} Months, ${newScheme.chitValueFormatted})`, 'Admin', newScheme.id);
 
   if (autoAnnounce && newScheme.status === 'active') {
-    createAutoAnnouncement({
+    await createAutoAnnouncement({
       title: `New Chit Scheme Launched: ${newScheme.nameEn} (${newScheme.durationMonths} Months)`,
       description: `We have introduced the ${newScheme.nameEn} for a ${newScheme.durationMonths}-month cycle with monthly instalments starting at ${formatInr(newScheme.firstMonthInstalment)} and prompt payment bonus up to ${formatInr(newScheme.totalBonus)}. Contact our Villukuri office to join.`,
       category: 'Scheme Update',
@@ -2081,7 +2289,7 @@ app.put('/api/admin/schemes/:id', async (req: Request, res: Response) => {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
   const { id } = req.params;
-  const schemes = getLocalSchemes();
+  const [schemes, groups] = await Promise.all([fetchSchemes(), fetchGroups()]);
   const target = schemes.find((s: any) => s.id === id);
   if (!target) {
     return res.status(404).json({ error: 'Scheme not found.' });
@@ -2102,7 +2310,6 @@ app.put('/api/admin/schemes/:id', async (req: Request, res: Response) => {
     autoAnnounce = true
   } = req.body;
 
-  const groups = getLocalGroups();
   const runningGroupsCount = groups.filter(
     (g: any) => g.status === 'active' && (g.scheme_id === target.id || Number(g.chit_value) === Number(target.chitValue))
   ).length;
@@ -2157,11 +2364,11 @@ app.put('/api/admin/schemes/:id', async (req: Request, res: Response) => {
   target.updatedAt = new Date().toISOString();
   saveLocalSchemes(schemes);
   await syncTableUpsert('chit_schemes', [schemeToDbRow(target)], 'id');
-  recordSchemeVersion(target, coreTermsChanged ? 'Modified chit amount/duration terms' : 'Updated scheme details', 'Admin');
-  recordAuditLog('SCHEME_UPDATE', `Updated Scheme ${target.id} to v${target.version} (${target.nameEn}, ${target.durationMonths}M)`, 'Admin', target.id);
+  await recordSchemeVersion(target, coreTermsChanged ? 'Modified chit amount/duration terms' : 'Updated scheme details', 'Admin');
+  await recordAuditLog('SCHEME_UPDATE', `Updated Scheme ${target.id} to v${target.version} (${target.nameEn}, ${target.durationMonths}M)`, 'Admin', target.id);
 
   if (autoAnnounce) {
-    createAutoAnnouncement({
+    await createAutoAnnouncement({
       title: `Scheme Updated (v${target.version}): ${target.nameEn}`,
       description: `Scheme "${target.nameEn}" (${target.chitValueFormatted}, ${target.durationMonths} Months) has been updated by Administration. Ongoing batches retain their original enrolled terms unless notified otherwise.`,
       category: 'Scheme Update',
@@ -2184,7 +2391,7 @@ app.patch('/api/admin/schemes/:id/status', async (req: Request, res: Response) =
   if (!['active', 'inactive', 'archived'].includes(status)) {
     return res.status(400).json({ error: 'Invalid scheme status.' });
   }
-  const schemes = getLocalSchemes();
+  const schemes = await fetchSchemes();
   const target = schemes.find((s: any) => s.id === id);
   if (!target) return res.status(404).json({ error: 'Scheme not found.' });
 
@@ -2193,10 +2400,10 @@ app.patch('/api/admin/schemes/:id/status', async (req: Request, res: Response) =
   target.updatedAt = new Date().toISOString();
   saveLocalSchemes(schemes);
   await syncTableUpsert('chit_schemes', [schemeToDbRow(target)], 'id');
-  recordAuditLog('SCHEME_STATUS_CHANGE', `Changed Scheme ${target.nameEn} status from ${prevStatus} to ${status}`, 'Admin', target.id);
+  await recordAuditLog('SCHEME_STATUS_CHANGE', `Changed Scheme ${target.nameEn} status from ${prevStatus} to ${status}`, 'Admin', target.id);
 
   if (prevStatus !== status && (status === 'active' || status === 'inactive')) {
-    createAutoAnnouncement({
+    await createAutoAnnouncement({
       title: `Scheme ${status === 'active' ? 'Activated' : 'Deactivated'}: ${target.nameEn}`,
       description:
         status === 'active'
@@ -2218,12 +2425,11 @@ app.delete('/api/admin/schemes/:id', async (req: Request, res: Response) => {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
   const { id } = req.params;
-  const schemes = getLocalSchemes();
+  const [schemes, groups] = await Promise.all([fetchSchemes(), fetchGroups()]);
   const idx = schemes.findIndex((s: any) => s.id === id);
   if (idx === -1) return res.status(404).json({ error: 'Scheme not found.' });
 
   const target = schemes[idx];
-  const groups = getLocalGroups();
   let referenced = groups.some((g: any) => g.scheme_id === target.id || Number(g.chit_value) === Number(target.chitValue));
 
   if (!referenced && supabase) {
@@ -2242,11 +2448,11 @@ app.delete('/api/admin/schemes/:id', async (req: Request, res: Response) => {
     await syncTableDelete('scheme_versions', 'scheme_id', id);
     const delRes = await syncTableDelete('chit_schemes', 'id', id);
     if (delRes.ok) {
-      const remainingVersions = getLocalSchemeVersions().filter((v: any) => v.scheme_id !== id);
+      const remainingVersions = (await fetchSchemeVersions()).filter((v: any) => v.scheme_id !== id);
       saveLocalSchemeVersions(remainingVersions);
       schemes.splice(idx, 1);
       saveLocalSchemes(schemes);
-      recordAuditLog('SCHEME_DELETE', `Deleted unused scheme: ${target.nameEn}`, 'Admin', target.id);
+      await recordAuditLog('SCHEME_DELETE', `Deleted unused scheme: ${target.nameEn}`, 'Admin', target.id);
       return res.json({ success: true, archived: false, message: `Scheme "${target.nameEn}" deleted.` });
     }
   }
@@ -2255,7 +2461,7 @@ app.delete('/api/admin/schemes/:id', async (req: Request, res: Response) => {
   target.updatedAt = new Date().toISOString();
   saveLocalSchemes(schemes);
   await syncTableUpsert('chit_schemes', [schemeToDbRow(target)], 'id');
-  recordAuditLog('SCHEME_ARCHIVE', `Archived Scheme ${target.nameEn} (referenced by existing chit groups)`, 'Admin', target.id);
+  await recordAuditLog('SCHEME_ARCHIVE', `Archived Scheme ${target.nameEn} (referenced by existing chit groups)`, 'Admin', target.id);
   return res.json({
     success: true,
     archived: true,
@@ -2266,16 +2472,18 @@ app.delete('/api/admin/schemes/:id', async (req: Request, res: Response) => {
 // ======================== ADMIN GROUP MANAGEMENT ========================
 
 // Get all groups with member counts & financial safeguard metadata
-app.get('/api/admin/groups', (req: Request, res: Response) => {
+app.get('/api/admin/groups', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
 
-  const groups = getLocalGroups();
-  const allUsers = getLocalUsers();
+  const [groups, allUsers, payments, configs] = await Promise.all([
+    fetchGroups(),
+    fetchUsers(),
+    fetchPayments(),
+    fetchPaymentConfigs()
+  ]);
   const activeUsers = allUsers.filter((u: any) => !u.is_deleted);
-  const payments = getLocalPayments();
-  const configs = getLocalPaymentConfigs();
 
   const groupsWithCount = groups.map((g: any) => {
     const member_count = activeUsers.filter((u: any) => u.group_id === g.id).length;
@@ -2308,13 +2516,12 @@ app.post('/api/admin/groups', async (req: Request, res: Response) => {
   }
 
   const cleanId = id.trim().toUpperCase();
-  const groups = getLocalGroups();
+  const [groups, schemes] = await Promise.all([fetchGroups(), fetchSchemes()]);
 
   if (groups.some((g: any) => g.id === cleanId)) {
     return res.status(400).json({ error: `Group ID "${cleanId}" already exists. Please choose a unique ID.` });
   }
 
-  const schemes = getLocalSchemes();
   const linkedScheme = scheme_id
     ? schemes.find((s: any) => s.id === scheme_id)
     : schemes.find((s: any) => Number(s.chitValue) === Number(chit_value));
@@ -2336,9 +2543,9 @@ app.post('/api/admin/groups', async (req: Request, res: Response) => {
   groups.push(newGroup);
   saveLocalGroups(groups);
   await syncTableUpsert('chit_groups', [groupToDbRow(newGroup)], 'id');
-  recordAuditLog('GROUP_CREATE', `Created Group: ${newGroup.id} (${newGroup.name}, ${newGroup.duration_months}M)`, 'Admin', newGroup.id);
+  await recordAuditLog('GROUP_CREATE', `Created Group: ${newGroup.id} (${newGroup.name}, ${newGroup.duration_months}M)`, 'Admin', newGroup.id);
 
-  createAutoAnnouncement({
+  await createAutoAnnouncement({
     title: `New Chit Group Opened: ${newGroup.name}`,
     description: `Batch ${newGroup.id} (${newGroup.scheme_name} · ${newGroup.duration_months} Months) is now active starting ${newGroup.start_date}.`,
     category: 'Group Update',
@@ -2370,7 +2577,7 @@ app.put('/api/admin/groups/:id', async (req: Request, res: Response) => {
 
   const { id } = req.params;
   const { name, scheme_id, scheme_name, chit_value, duration_months, start_date, status } = req.body;
-  const groups = getLocalGroups();
+  const groups = await fetchGroups();
   const target = groups.find((g: any) => g.id === id);
 
   if (!target) {
@@ -2398,10 +2605,10 @@ app.put('/api/admin/groups/:id', async (req: Request, res: Response) => {
   if (!syncRes.ok && target.status === 'archived') {
     await syncTableUpsert('chit_groups', [groupToDbRow({ ...target, status: 'inactive', archived_at: undefined })], 'id');
   }
-  recordAuditLog('GROUP_UPDATE', `Updated Group: ${target.id} (${target.name})`, 'Admin', target.id);
+  await recordAuditLog('GROUP_UPDATE', `Updated Group: ${target.id} (${target.name})`, 'Admin', target.id);
 
   if (target.status !== 'archived') {
-    createAutoAnnouncement({
+    await createAutoAnnouncement({
       title: `Group Details Updated: ${target.name}`,
       description: `Administration updated details for ${target.name} (${target.id} · ${target.scheme_name}, ${target.duration_months || 20} Months).`,
       category: 'Group Update',
@@ -2427,7 +2634,7 @@ app.patch('/api/admin/groups/:id/status', async (req: Request, res: Response) =>
     return res.status(400).json({ error: 'Invalid group status.' });
   }
 
-  const groups = getLocalGroups();
+  const groups = await fetchGroups();
   const target = groups.find((g: any) => g.id === id);
   if (!target) return res.status(404).json({ error: 'Group not found.' });
   if (target.status === 'archived') {
@@ -2440,10 +2647,10 @@ app.patch('/api/admin/groups/:id/status', async (req: Request, res: Response) =>
   saveLocalGroups(groups);
   await syncTableUpsert('chit_groups', [groupToDbRow(target)], 'id');
 
-  recordAuditLog('GROUP_STATUS_CHANGE', `Set Group ${target.id} status to ${status}`, 'Admin', target.id);
+  await recordAuditLog('GROUP_STATUS_CHANGE', `Set Group ${target.id} status to ${status}`, 'Admin', target.id);
 
   if (prevStatus !== status) {
-    createAutoAnnouncement({
+    await createAutoAnnouncement({
       title: `Group ${status === 'active' ? 'Activated' : 'Paused'}: ${target.name}`,
       description: `Group ${target.name} (${target.id}) status has been set to ${status.toUpperCase()}.`,
       category: 'Group Update',
@@ -2464,7 +2671,12 @@ app.delete('/api/admin/groups/:id', async (req: Request, res: Response) => {
   }
 
   const { id } = req.params;
-  const groups = getLocalGroups();
+  const [groups, allUsers, payments, configs] = await Promise.all([
+    fetchGroups(),
+    fetchUsers(),
+    fetchPayments(),
+    fetchPaymentConfigs()
+  ]);
   const groupIdx = groups.findIndex((g: any) => g.id === id);
 
   if (groupIdx === -1) {
@@ -2472,9 +2684,6 @@ app.delete('/api/admin/groups/:id', async (req: Request, res: Response) => {
   }
 
   const target = groups[groupIdx];
-  const allUsers = getLocalUsers();
-  const payments = getLocalPayments();
-  const configs = getLocalPaymentConfigs();
 
   let linkedUsersCount = allUsers.filter((u: any) => u.group_id === id).length;
   let linkedPaymentsCount = payments.filter((p: any) => p.group_id === id).length;
@@ -2508,7 +2717,7 @@ app.delete('/api/admin/groups/:id', async (req: Request, res: Response) => {
     if (deleteRes.ok) {
       groups.splice(groupIdx, 1);
       saveLocalGroups(groups);
-      recordAuditLog(
+      await recordAuditLog(
         'GROUP_DELETE',
         `Permanently deleted unused Chit Group ${target.id} (${target.name})`,
         'Admin',
@@ -2552,7 +2761,7 @@ app.delete('/api/admin/groups/:id', async (req: Request, res: Response) => {
     migrationNotice = 'Run supabase/migration_v3.sql in Supabase SQL Editor to persist native archived status in PostgreSQL.';
   }
 
-  recordAuditLog(
+  await recordAuditLog(
     'GROUP_ARCHIVE',
     `Archived Chit Group ${target.id} (${target.name}) — preserved ${linkedUsersCount} member(s) and ${linkedPaymentsCount} payment record(s)`,
     'Admin',
@@ -2570,13 +2779,13 @@ app.delete('/api/admin/groups/:id', async (req: Request, res: Response) => {
 });
 
 // Get members of specific group
-app.get('/api/admin/groups/:id/members', (req: Request, res: Response) => {
+app.get('/api/admin/groups/:id/members', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
 
   const { id } = req.params;
-  const users = getLocalUsers().filter((u: any) => !u.is_deleted);
+  const users = (await fetchUsers()).filter((u: any) => !u.is_deleted);
   const members = users.filter((u: any) => u.group_id === id);
 
   const safeMembers = members.map((m: any) => {
@@ -2590,15 +2799,18 @@ app.get('/api/admin/groups/:id/members', (req: Request, res: Response) => {
 // ======================== ADMIN USER MANAGEMENT ========================
 
 // Get all users
-app.get('/api/admin/users', (req: Request, res: Response) => {
+app.get('/api/admin/users', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
 
   const includeDeleted = req.query.include_deleted === 'true';
-  const users = getLocalUsers().filter((u: any) => includeDeleted || !u.is_deleted);
-  const groups = getLocalGroups();
-  const payments = getLocalPayments();
+  const [allUsers, groups, payments] = await Promise.all([
+    fetchUsers(),
+    fetchGroups(),
+    fetchPayments()
+  ]);
+  const users = allUsers.filter((u: any) => includeDeleted || !u.is_deleted);
 
   const safeUsers = users.map((u: any) => {
     const { password_hash, ...safe } = u;
@@ -2635,7 +2847,7 @@ app.post('/api/admin/users', async (req: Request, res: Response) => {
   }
 
   const cleanUserId = user_id.trim().toUpperCase();
-  const users = getLocalUsers();
+  const [users, groups] = await Promise.all([fetchUsers(), fetchGroups()]);
 
   // 1. Validate unique User ID
   if (users.some((u: any) => u.user_id.toLowerCase() === cleanUserId.toLowerCase())) {
@@ -2643,7 +2855,6 @@ app.post('/api/admin/users', async (req: Request, res: Response) => {
   }
 
   // 2. Validate group existence, active state, and Max 99 members constraint
-  const groups = getLocalGroups();
   const group = groups.find((g: any) => g.id === group_id);
   if (!group) {
     return res.status(400).json({ error: 'Selected group does not exist.' });
@@ -2679,7 +2890,7 @@ app.post('/api/admin/users', async (req: Request, res: Response) => {
   saveLocalUsers(users);
   await syncTableUpsert('chit_users', [userToDbRow(newUser)], 'id');
 
-  recordAuditLog('USER_CREATE', `Created User: ${newUser.user_id} (${newUser.full_name}) in Group ${group.name}`, 'Admin', newUser.user_id);
+  await recordAuditLog('USER_CREATE', `Created User: ${newUser.user_id} (${newUser.full_name}) in Group ${group.name}`, 'Admin', newUser.user_id);
 
   const { password_hash, ...safeUser } = newUser;
   return res.status(201).json({
@@ -2698,7 +2909,7 @@ app.put('/api/admin/users/:id', async (req: Request, res: Response) => {
   const { id } = req.params;
   const { full_name, mobile_number, address, city, email, group_id } = req.body;
 
-  const users = getLocalUsers();
+  const [users, groups] = await Promise.all([fetchUsers(), fetchGroups()]);
   const target = users.find((u: any) => u.id === id || u.user_id === id);
 
   if (!target) {
@@ -2707,7 +2918,6 @@ app.put('/api/admin/users/:id', async (req: Request, res: Response) => {
 
   // If changing group, check not archived and max 99 members
   if (group_id && group_id !== target.group_id) {
-    const groups = getLocalGroups();
     const newGroup = groups.find((g: any) => g.id === group_id);
     if (!newGroup) return res.status(400).json({ error: 'Target group does not exist.' });
     if (newGroup.status === 'archived') {
@@ -2731,7 +2941,7 @@ app.put('/api/admin/users/:id', async (req: Request, res: Response) => {
 
   saveLocalUsers(users);
   await syncTableUpsert('chit_users', [userToDbRow(target)], 'id');
-  recordAuditLog('USER_UPDATE', `Updated User details for ${target.user_id} (${target.full_name})`, 'Admin', target.user_id);
+  await recordAuditLog('USER_UPDATE', `Updated User details for ${target.user_id} (${target.full_name})`, 'Admin', target.user_id);
 
   const { password_hash, ...safeUser } = target;
   return res.json({ success: true, user: safeUser, message: 'User updated successfully.' });
@@ -2751,7 +2961,7 @@ app.patch('/api/admin/users/:id/password', async (req: Request, res: Response) =
     return res.status(400).json({ error: pwError });
   }
 
-  const users = getLocalUsers();
+  const users = await fetchUsers();
   const target = users.find((u: any) => u.id === id || u.user_id === id);
 
   if (!target) {
@@ -2759,8 +2969,10 @@ app.patch('/api/admin/users/:id/password', async (req: Request, res: Response) =
   }
 
   const newHash = hashPassword(new_password);
+  const now = new Date().toISOString();
   target.password_hash = newHash;
-  target.updated_at = new Date().toISOString();
+  target.password_changed_at = now;
+  target.updated_at = now;
   saveLocalUsers(users);
 
   // Sync to Supabase DB / Auth Admin API if configured
@@ -2781,7 +2993,7 @@ app.patch('/api/admin/users/:id/password', async (req: Request, res: Response) =
   // Force logout of existing sessions for this user
   const revokedCount = revokeUserSessions(target.user_id);
 
-  recordAuditLog('PASSWORD_RESET', `Admin reset login password for ${target.user_id} (${target.full_name}); invalidated ${revokedCount} active session(s)`, 'Admin', target.user_id);
+  await recordAuditLog('PASSWORD_RESET', `Admin reset login password for ${target.user_id} (${target.full_name}); invalidated ${revokedCount} active session(s)`, 'Admin', target.user_id);
   return res.json({
     success: true,
     revokedSessions: revokedCount,
@@ -2802,7 +3014,7 @@ app.patch('/api/admin/users/:id/status', async (req: Request, res: Response) => 
     return res.status(400).json({ error: 'Invalid user status.' });
   }
 
-  const users = getLocalUsers();
+  const users = await fetchUsers();
   const target = users.find((u: any) => u.id === id || u.user_id === id);
 
   if (!target) {
@@ -2820,7 +3032,7 @@ app.patch('/api/admin/users/:id/status', async (req: Request, res: Response) => 
   saveLocalUsers(users);
   await syncTableUpsert('chit_users', [userToDbRow(target)], 'id');
 
-  recordAuditLog('USER_STATUS_CHANGE', `Changed User ${target.user_id} status to ${status}`, 'Admin', target.user_id);
+  await recordAuditLog('USER_STATUS_CHANGE', `Changed User ${target.user_id} status to ${status}`, 'Admin', target.user_id);
   return res.json({ success: true, user_id: target.user_id, status });
 });
 
@@ -2831,7 +3043,7 @@ app.delete('/api/admin/users/:id', async (req: Request, res: Response) => {
   }
 
   const { id } = req.params;
-  const users = getLocalUsers();
+  const [users, payments] = await Promise.all([fetchUsers(), fetchPayments()]);
   const userIndex = users.findIndex((u: any) => u.id === id || u.user_id === id);
 
   if (userIndex === -1) {
@@ -2839,7 +3051,6 @@ app.delete('/api/admin/users/:id', async (req: Request, res: Response) => {
   }
 
   const user = users[userIndex];
-  const payments = getLocalPayments();
   const hasPayments = payments.some((p: any) => p.user_id === user.user_id);
 
   // Immediately revoke any open member sessions
@@ -2864,7 +3075,7 @@ app.delete('/api/admin/users/:id', async (req: Request, res: Response) => {
       }
     }
 
-    recordAuditLog(
+    await recordAuditLog(
       'USER_SOFT_DELETE',
       `Soft-deleted & deactivated User ${user.user_id} (${user.full_name}); financial payment history preserved`,
       'Admin',
@@ -2889,7 +3100,7 @@ app.delete('/api/admin/users/:id', async (req: Request, res: Response) => {
     }
   }
 
-  recordAuditLog('USER_DELETE', `Permanently deleted User: ${user.user_id} (${user.full_name}) (no financial records)`, 'Admin', user.user_id);
+  await recordAuditLog('USER_DELETE', `Permanently deleted User: ${user.user_id} (${user.full_name}) (no financial records)`, 'Admin', user.user_id);
 
   return res.json({
     success: true,
@@ -2901,13 +3112,13 @@ app.delete('/api/admin/users/:id', async (req: Request, res: Response) => {
 // ======================== ADMIN MONTHLY PAYMENT MANAGEMENT ========================
 
 // Get payments with filters
-app.get('/api/admin/payments', (req: Request, res: Response) => {
+app.get('/api/admin/payments', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
 
   const { group_id, month, year, user_id, status, search } = req.query;
-  const allPayments = getLocalPayments();
+  const allPayments = await fetchPayments();
 
   let filtered = allPayments;
 
@@ -2967,14 +3178,19 @@ app.post('/api/admin/payments/configure', async (req: Request, res: Response) =>
     return res.status(400).json({ error: 'Payment amount must be a positive number.' });
   }
 
-  const groups = getLocalGroups();
+  const [groups, users, payments, configs] = await Promise.all([
+    fetchGroups(),
+    fetchUsers(),
+    fetchPayments(),
+    fetchPaymentConfigs()
+  ]);
+
   const group = groups.find((g: any) => g.id === group_id);
   if (!group) return res.status(404).json({ error: 'Selected group does not exist.' });
   if (group.status === 'archived') {
     return res.status(400).json({ error: `Cannot publish monthly payments for archived group "${group.name}".` });
   }
 
-  const users = getLocalUsers();
   const groupMembers = users.filter((u: any) => !u.is_deleted && u.group_id === group_id && u.status === 'active');
 
   if (groupMembers.length === 0) {
@@ -2986,7 +3202,6 @@ app.post('/api/admin/payments/configure', async (req: Request, res: Response) =>
     return res.status(400).json({ error: `Month cycle must be between 1 and ${maxMonths} for group "${group.name}".` });
   }
 
-  const payments = getLocalPayments();
   const newlyCreatedPayments: any[] = [];
   let createdCount = 0;
   let existingCount = 0;
@@ -3034,7 +3249,6 @@ app.post('/api/admin/payments/configure', async (req: Request, res: Response) =>
   }
 
   // Save payment config
-  const configs = getLocalPaymentConfigs();
   const newConfig = {
     id: `cfg-${group_id}-m${month}-${year}`,
     group_id: group.id,
@@ -3051,7 +3265,7 @@ app.post('/api/admin/payments/configure', async (req: Request, res: Response) =>
   saveLocalPaymentConfigs(configs);
   await syncTableUpsert('monthly_payment_configs', [paymentConfigToDbRow(newConfig)], 'id');
 
-  recordAuditLog(
+  await recordAuditLog(
     'MONTHLY_PAYMENT_CONFIGURED',
     `Set ${monthLabelText} payment to ₹${numAmount.toLocaleString('en-IN')} for Group ${group.name}. Created ${createdCount} new UNPAID records (${existingCount} existed).`,
     'Admin',
@@ -3059,7 +3273,7 @@ app.post('/api/admin/payments/configure', async (req: Request, res: Response) =>
   );
 
   if (createdCount > 0) {
-    createAutoAnnouncement({
+    await createAutoAnnouncement({
       title: `Monthly Instalment Published: ${monthLabelText} (${group.name})`,
       description: `The monthly instalment for ${group.name} (${monthLabelText}) has been set to ${formatInr(numAmount)}. Please pay on or before the 10th at our Villukuri office counter to maintain eligibility for the prompt payment bonus.`,
       category: 'Payment Notice',
@@ -3091,7 +3305,7 @@ app.patch('/api/admin/payments/:id/status', async (req: Request, res: Response) 
     return res.status(400).json({ error: 'Status must be PAID or UNPAID.' });
   }
 
-  const payments = getLocalPayments();
+  const payments = await fetchPayments();
   const target = payments.find((p: any) => p.id === id);
 
   if (!target) {
@@ -3106,7 +3320,7 @@ app.patch('/api/admin/payments/:id/status', async (req: Request, res: Response) 
     target.payment_date = payment_date || new Date().toISOString();
     target.receipt_number = receipt_number || `REC-${Date.now().toString().slice(-6)}`;
     if (notes) target.notes = notes;
-    recordAuditLog(
+    await recordAuditLog(
       'PAYMENT_STATUS_PAID',
       `Cash payment of ₹${target.payment_amount} received for ${target.user_name} (${target.user_id}) - ${target.month_name}. Receipt: ${target.receipt_number}`,
       'Admin',
@@ -3116,7 +3330,7 @@ app.patch('/api/admin/payments/:id/status', async (req: Request, res: Response) 
     // Changed back to UNPAID
     target.payment_date = null;
     if (notes) target.notes = notes;
-    recordAuditLog(
+    await recordAuditLog(
       'PAYMENT_STATUS_UNPAID',
       `Payment status reversed to UNPAID for ${target.user_name} (${target.user_id}) - ${target.month_name}`,
       'Admin',
@@ -3146,7 +3360,7 @@ app.post('/api/admin/payments/batch-status', async (req: Request, res: Response)
     return res.status(400).json({ error: 'Invalid batch payment parameters.' });
   }
 
-  const payments = getLocalPayments();
+  const payments = await fetchPayments();
   const updatedRows: any[] = [];
   let updatedCount = 0;
   const now = new Date().toISOString();
@@ -3171,7 +3385,7 @@ app.post('/api/admin/payments/batch-status', async (req: Request, res: Response)
   if (updatedRows.length > 0) {
     await syncTableUpsert('payment_records', updatedRows.map(paymentToDbRow), 'id');
   }
-  recordAuditLog('BATCH_PAYMENT_UPDATE', `Batch updated ${updatedCount} payment records to ${status}`, 'Admin');
+  await recordAuditLog('BATCH_PAYMENT_UPDATE', `Batch updated ${updatedCount} payment records to ${status}`, 'Admin');
 
   return res.json({
     success: true,
@@ -3181,21 +3395,21 @@ app.post('/api/admin/payments/batch-status', async (req: Request, res: Response)
 });
 
 // Get payment configs list
-app.get('/api/admin/payments/configs', (req: Request, res: Response) => {
+app.get('/api/admin/payments/configs', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
-  return res.json({ configs: getLocalPaymentConfigs() });
+  return res.json({ configs: await fetchPaymentConfigs() });
 });
 
 // ======================== ADMIN NEWS & ANNOUNCEMENTS ========================
 
-app.get('/api/admin/announcements', (req: Request, res: Response) => {
+app.get('/api/admin/announcements', async (req: Request, res: Response) => {
   if (!isValidAdminAuth(req)) {
     return res.status(401).json({ error: 'Unauthorized.' });
   }
   const includeArchived = req.query.include_archived === 'true';
-  const announcements = getLocalAnnouncements().filter((a: any) => includeArchived || !a.is_archived);
+  const announcements = (await fetchAnnouncements()).filter((a: any) => includeArchived || !a.is_archived);
   announcements.sort((a: any, b: any) => new Date(b.created_at || b.publish_date).getTime() - new Date(a.created_at || a.publish_date).getTime());
   return res.json({ announcements });
 });
@@ -3220,8 +3434,11 @@ app.post('/api/admin/announcements', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Please provide both title and description.' });
   }
 
-  const groups = getLocalGroups();
-  const schemes = getLocalSchemes();
+  const [groups, schemes, announcements] = await Promise.all([
+    fetchGroups(),
+    fetchSchemes(),
+    fetchAnnouncements()
+  ]);
   const resolvedGroup = target_group_id && target_group_id !== 'all' ? groups.find((g: any) => g.id === target_group_id) : null;
   const resolvedScheme = target_scheme_id ? schemes.find((s: any) => s.id === target_scheme_id) : null;
 
@@ -3232,7 +3449,6 @@ app.post('/api/admin/announcements', async (req: Request, res: Response) => {
       ? 'group'
       : 'all';
 
-  const announcements = getLocalAnnouncements();
   const newAnnouncement = {
     id: `ann-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
     title: title.trim(),
@@ -3255,7 +3471,7 @@ app.post('/api/admin/announcements', async (req: Request, res: Response) => {
   saveLocalAnnouncements(announcements);
   await syncTableUpsert('announcements', [announcementToDbRow(newAnnouncement)], 'id');
 
-  recordAuditLog('ANNOUNCEMENT_CREATE', `Published announcement: "${newAnnouncement.title}"`, 'Admin', newAnnouncement.id);
+  await recordAuditLog('ANNOUNCEMENT_CREATE', `Published announcement: "${newAnnouncement.title}"`, 'Admin', newAnnouncement.id);
   return res.status(201).json({ success: true, announcement: newAnnouncement, message: 'Announcement published successfully.' });
 });
 
@@ -3267,7 +3483,7 @@ app.put('/api/admin/announcements/:id', async (req: Request, res: Response) => {
   const { id } = req.params;
   const { title, description, category, target_group_id, publish_date, is_published } = req.body;
 
-  const announcements = getLocalAnnouncements();
+  const announcements = await fetchAnnouncements();
   const target = announcements.find((a: any) => a.id === id);
 
   if (!target) return res.status(404).json({ error: 'Announcement not found.' });
@@ -3282,7 +3498,7 @@ app.put('/api/admin/announcements/:id', async (req: Request, res: Response) => {
 
   saveLocalAnnouncements(announcements);
   await syncTableUpsert('announcements', [announcementToDbRow(target)], 'id');
-  recordAuditLog('ANNOUNCEMENT_UPDATE', `Updated announcement: "${target.title}"`, 'Admin', target.id);
+  await recordAuditLog('ANNOUNCEMENT_UPDATE', `Updated announcement: "${target.title}"`, 'Admin', target.id);
 
   return res.json({ success: true, announcement: target, message: 'Announcement updated.' });
 });
@@ -3294,7 +3510,7 @@ app.delete('/api/admin/announcements/:id', async (req: Request, res: Response) =
 
   const { id } = req.params;
   const mode = req.query.mode as string | undefined;
-  const announcements = getLocalAnnouncements();
+  const announcements = await fetchAnnouncements();
   const index = announcements.findIndex((a: any) => a.id === id);
 
   if (index === -1) return res.status(404).json({ error: 'Announcement not found or already deleted.' });
@@ -3322,7 +3538,7 @@ app.delete('/api/admin/announcements/:id', async (req: Request, res: Response) =
       }
     }
 
-    recordAuditLog('ANNOUNCEMENT_ARCHIVE', `Archived historical/auto announcement: "${target.title}"`, 'Admin', target.id);
+    await recordAuditLog('ANNOUNCEMENT_ARCHIVE', `Archived historical/auto announcement: "${target.title}"`, 'Admin', target.id);
     return res.json({ success: true, archived: true, message: `Announcement "${target.title}" archived and hidden from member dashboards.` });
   }
 
@@ -3337,21 +3553,19 @@ app.delete('/api/admin/announcements/:id', async (req: Request, res: Response) =
     }
   }
 
-  recordAuditLog('ANNOUNCEMENT_DELETE', `Deleted announcement: "${deleted.title}"`, 'Admin', deleted.id);
+  await recordAuditLog('ANNOUNCEMENT_DELETE', `Deleted announcement: "${deleted.title}"`, 'Admin', deleted.id);
   return res.json({ success: true, archived: false, message: `Announcement "${deleted.title}" deleted successfully.` });
 });
 
 // ======================== SERVING FRONTEND ========================
 
 async function startServer() {
-  const httpServer = createHttpServer(app);
-
   if (!isProd) {
     // Development mode with Vite middleware
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
-        middlewareMode: { server: httpServer },
+        middlewareMode: true,
         allowedHosts: true,
       },
       appType: 'spa'
@@ -3366,17 +3580,17 @@ async function startServer() {
     });
   }
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Server] TEAM STARS CHITS portal running at http://0.0.0.0:${PORT}`);
     console.log(`[Mode] ${isProd ? 'Production' : 'Development'}`);
     void bootstrapSupabaseData();
   });
 }
 
-export default app;
-
-if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+if (!isVercel) {
   startServer().catch(err => {
     console.error('[Fatal Server Startup Error]:', err);
   });
 }
+
+export default app;
