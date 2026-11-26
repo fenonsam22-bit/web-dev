@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { Resend } from 'resend';
-
+#comment
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
